@@ -4,8 +4,8 @@
     .fingerprint = 0x8cf1558f8ea40aa6,
     .dependencies = .{
         .nostr = .{
-            .url = "https://github.com/privkeyio/libnostr-z/archive/refs/tags/v0.1.5.tar.gz",
-            .hash = "nostr-0.1.5-JY6OcCJ8AwAwjogdbVGytz441ubPbLHJNSie41ag2C3o",
+            .url = "https://github.com/privkeyio/libnostr-z/archive/refs/tags/v0.1.6.tar.gz",
+            .hash = "nostr-0.1.6-JY6OcMPABABT9tx-BY8jcJpBa-boEF20VbZY-iX3DMMe",
         },
         .websocket = .{
             .url = "https://github.com/karlseguin/websocket.zig/archive/refs/heads/master.tar.gz",
