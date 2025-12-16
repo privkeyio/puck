@@ -1,0 +1,7 @@
+[nostr]
+privkey = "nsec1..."
+relay = "wss://relay.getalby.com/v1"
+
+[lnbits]
+host = "https://legend.lnbits.com"
+admin_key = "your-admin-key-here"
