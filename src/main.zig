@@ -93,7 +93,9 @@ fn runEventLoop(allocator: std.mem.Allocator, config: *Config, lnbits: *LnbitsCl
         };
 
         if (msg) |m| {
-            switch (m) {
+            var message = m;
+            defer relay.freeMessage(&message);
+            switch (message) {
                 .event => |e| {
                     handleEvent(allocator, config, lnbits, &relay, e.event_json) catch |err| {
                         std.log.err("Failed to handle event: {}", .{err});

@@ -8,10 +8,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const websocket = b.dependency("websocket", .{
-        .target = target,
-        .optimize = optimize,
-    });
 
     const exe = b.addExecutable(.{
         .name = "puck",
@@ -21,7 +17,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "nostr", .module = nostr.module("nostr") },
-                .{ .name = "websocket", .module = websocket.module("websocket") },
             },
         }),
     });
@@ -43,7 +38,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "nostr", .module = nostr.module("nostr") },
-                .{ .name = "websocket", .module = websocket.module("websocket") },
             },
         }),
     });

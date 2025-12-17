@@ -1,5 +1,6 @@
 const std = @import("std");
-const websocket = @import("websocket");
+const nostr = @import("nostr");
+const ws = nostr.ws;
 
 const log = std.log.scoped(.relay);
 
@@ -32,88 +33,64 @@ pub const Message = union(enum) {
 pub const Relay = struct {
     allocator: std.mem.Allocator,
     url: []const u8,
-    client: websocket.Client,
-    recv_buf: []u8,
-    ca_bundle: ?std.crypto.Certificate.Bundle,
+    client: ws.Client,
 
     pub fn connect(allocator: std.mem.Allocator, url: []const u8) !Relay {
-        const parsed = parseWsUrl(url) orelse {
-            log.err("Invalid WebSocket URL: {s}", .{url});
+        var client = ws.Client.connect(allocator, url) catch |err| {
+            log.err("WebSocket connection failed: {}", .{err});
             return RelayError.ConnectionFailed;
         };
-
-        var ca_bundle: ?std.crypto.Certificate.Bundle = null;
-        if (parsed.tls) {
-            ca_bundle = std.crypto.Certificate.Bundle{};
-            ca_bundle.?.rescan(allocator) catch |err| {
-                log.err("Failed to scan CA certificates: {}", .{err});
-                return RelayError.ConnectionFailed;
-            };
-        }
-        errdefer if (ca_bundle) |*b| b.deinit(allocator);
-
-        var client = websocket.Client.init(allocator, .{
-            .tls = parsed.tls,
-            .host = parsed.host,
-            .port = parsed.port,
-            .ca_bundle = ca_bundle,
-        }) catch |err| {
-            log.err("WebSocket init failed: {}", .{err});
-            return RelayError.ConnectionFailed;
-        };
-        errdefer client.deinit();
-
-        var host_header_buf: [256]u8 = undefined;
-        const host_header = std.fmt.bufPrint(&host_header_buf, "Host: {s}\r\n", .{parsed.host}) catch {
-            log.err("Host too long", .{});
-            return RelayError.ConnectionFailed;
-        };
-
-        client.handshake(parsed.path, .{
-            .headers = host_header,
-        }) catch |err| {
-            log.err("WebSocket handshake failed: {}", .{err});
-            return RelayError.ConnectionFailed;
-        };
-
-        const recv_buf = allocator.alloc(u8, 65536) catch return RelayError.ConnectionFailed;
+        errdefer client.close();
 
         return .{
             .allocator = allocator,
             .url = url,
             .client = client,
-            .recv_buf = recv_buf,
-            .ca_bundle = ca_bundle,
         };
     }
 
     pub fn deinit(self: *Relay) void {
-        self.allocator.free(self.recv_buf);
-        self.client.deinit();
-        if (self.ca_bundle) |*b| b.deinit(self.allocator);
+        self.client.close();
     }
 
     pub fn send(self: *Relay, data: []const u8) !void {
-        if (data.len > self.recv_buf.len) return RelayError.SendFailed;
-        @memcpy(self.recv_buf[0..data.len], data);
-        self.client.writeText(self.recv_buf[0..data.len]) catch return RelayError.SendFailed;
+        self.client.sendText(data) catch return RelayError.SendFailed;
     }
 
     pub fn receive(self: *Relay) !?Message {
-        const msg = self.client.read() catch |err| {
+        const msg = self.client.recvMessage() catch |err| {
             if (err == error.EndOfStream or err == error.ConnectionResetByPeer) {
                 return RelayError.Closed;
             }
             return null;
         };
 
-        if (msg) |m| {
-            defer self.client.done(m);
-            if (m.type == .text or m.type == .binary) {
-                return parseMessage(m.data);
-            }
+        const result = parseMessage(msg.payload, self.allocator) catch |err| {
+            msg.deinit();
+            return err;
+        };
+        msg.deinit();
+        return result;
+    }
+
+    pub fn freeMessage(self: *Relay, message: *Message) void {
+        switch (message.*) {
+            .event => |e| {
+                self.allocator.free(e.subscription_id);
+                self.allocator.free(e.event_json);
+            },
+            .ok => |o| {
+                self.allocator.free(o.event_id);
+                self.allocator.free(o.message);
+            },
+            .eose => |s| self.allocator.free(s),
+            .notice => |s| self.allocator.free(s),
+            .closed => |c| {
+                self.allocator.free(c.subscription_id);
+                self.allocator.free(c.message);
+            },
+            .unknown => {},
         }
-        return null;
     }
 
     pub fn publish(self: *Relay, event_json: []const u8) !void {
@@ -135,47 +112,7 @@ pub const Relay = struct {
     }
 };
 
-const ParsedUrl = struct {
-    host: []const u8,
-    port: u16,
-    path: []const u8,
-    tls: bool,
-};
-
-fn parseWsUrl(url: []const u8) ?ParsedUrl {
-    var remaining = url;
-    var tls = false;
-
-    if (std.mem.startsWith(u8, remaining, "wss://")) {
-        tls = true;
-        remaining = remaining[6..];
-    } else if (std.mem.startsWith(u8, remaining, "ws://")) {
-        remaining = remaining[5..];
-    } else {
-        return null;
-    }
-
-    const path_start = std.mem.indexOf(u8, remaining, "/") orelse remaining.len;
-    const host_port = remaining[0..path_start];
-    const path = if (path_start < remaining.len) remaining[path_start..] else "/";
-
-    var port: u16 = if (tls) 443 else 80;
-    var host = host_port;
-
-    if (std.mem.indexOf(u8, host_port, ":")) |colon| {
-        host = host_port[0..colon];
-        port = std.fmt.parseInt(u16, host_port[colon + 1 ..], 10) catch return null;
-    }
-
-    return .{
-        .host = host,
-        .port = port,
-        .path = path,
-        .tls = tls,
-    };
-}
-
-fn parseMessage(data: []const u8) Message {
+fn parseMessage(data: []const u8, allocator: std.mem.Allocator) !Message {
     if (data.len < 5) return .unknown;
     if (data[0] != '[') return .unknown;
 
@@ -201,9 +138,12 @@ fn parseMessage(data: []const u8) Message {
                 if (data[pos] == '}') {
                     depth -= 1;
                     if (depth == 0) {
+                        const sub_id_copy = try allocator.dupe(u8, sub_id);
+                        errdefer allocator.free(sub_id_copy);
+                        const event_json_copy = try allocator.dupe(u8, data[event_start .. pos + 1]);
                         return .{ .event = .{
-                            .subscription_id = sub_id,
-                            .event_json = data[event_start .. pos + 1],
+                            .subscription_id = sub_id_copy,
+                            .event_json = event_json_copy,
                         } };
                     }
                 }
@@ -229,10 +169,13 @@ fn parseMessage(data: []const u8) Message {
             }
         }
 
+        const event_id_copy = try allocator.dupe(u8, event_id);
+        errdefer allocator.free(event_id_copy);
+        const message_copy = try allocator.dupe(u8, message);
         return .{ .ok = .{
-            .event_id = event_id,
+            .event_id = event_id_copy,
             .success = success,
-            .message = message,
+            .message = message_copy,
         } };
     }
 
@@ -241,13 +184,13 @@ fn parseMessage(data: []const u8) Message {
         while (pos < data.len and (data[pos] == ',' or data[pos] == ' ' or data[pos] == '"')) : (pos += 1) {}
         const sub_start = pos;
         while (pos < data.len and data[pos] != '"') : (pos += 1) {}
-        return .{ .eose = data[sub_start..pos] };
+        return .{ .eose = try allocator.dupe(u8, data[sub_start..pos]) };
     }
 
     if (std.mem.eql(u8, msg_type, "NOTICE")) {
         if (std.mem.lastIndexOf(u8, data, "\"")) |last_quote| {
             if (lastIndexOfBefore(data, '"', last_quote)) |second_last| {
-                return .{ .notice = data[second_last + 1 .. last_quote] };
+                return .{ .notice = try allocator.dupe(u8, data[second_last + 1 .. last_quote]) };
             }
         }
         return .unknown;
@@ -267,9 +210,12 @@ fn parseMessage(data: []const u8) Message {
             }
         }
 
+        const sub_id_copy = try allocator.dupe(u8, sub_id);
+        errdefer allocator.free(sub_id_copy);
+        const message_copy = try allocator.dupe(u8, message);
         return .{ .closed = .{
-            .subscription_id = sub_id,
-            .message = message,
+            .subscription_id = sub_id_copy,
+            .message = message_copy,
         } };
     }
 
