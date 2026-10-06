@@ -1,6 +1,7 @@
 [nostr]
 privkey = "nsec1..."
 relay = "wss://relay.getalby.com/v1"
+client_pubkeys = ["<client-pubkey-hex-or-npub>"]
 
 [lnbits]
 host = "https://legend.lnbits.com"

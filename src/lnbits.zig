@@ -6,6 +6,7 @@ pub const LnbitsError = error{
     PaymentFailed,
     InvoiceNotFound,
     InsufficientBalance,
+    InvalidAmount,
 };
 
 pub const WalletInfo = struct {
@@ -40,17 +41,17 @@ pub const Client = struct {
     admin_key: []const u8,
     http_client: std.http.Client,
 
-    pub fn init(allocator: std.mem.Allocator, host: []const u8, admin_key: []const u8) Client {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, host: []const u8, admin_key: []const u8) Client {
         return .{
             .allocator = allocator,
             .host = host,
             .admin_key = admin_key,
-            .http_client = .{ .allocator = allocator },
+            .http_client = .{ .allocator = allocator, .io = io },
         };
     }
 
     pub fn deinit(self: *Client) void {
-        self.http_client.connection_pool.deinit();
+        self.http_client.deinit();
     }
 
     pub fn getWallet(self: *Client) !WalletInfo {
@@ -62,12 +63,13 @@ pub const Client = struct {
 
         return .{
             .name = name,
-            .balance = @intCast(balance_msat),
+            .balance = std.math.cast(u64, balance_msat) orelse return LnbitsError.InvalidResponse,
         };
     }
 
     pub fn createInvoice(self: *Client, amount_msat: u64, memo: ?[]const u8) !Invoice {
-        var body_buf: [512]u8 = undefined;
+        if (amount_msat == 0 or amount_msat % 1000 != 0) return LnbitsError.InvalidAmount;
+        var body_buf: [2048]u8 = undefined;
         const amount_sats = amount_msat / 1000;
         const body = if (memo) |m|
             std.fmt.bufPrint(&body_buf, "{{\"out\":false,\"amount\":{d},\"memo\":\"{s}\"}}", .{ amount_sats, m }) catch return LnbitsError.RequestFailed
@@ -102,6 +104,7 @@ pub const Client = struct {
     }
 
     pub fn lookupPayment(self: *Client, payment_hash: []const u8) !PaymentDetails {
+        if (!isPaymentHash(payment_hash)) return LnbitsError.InvoiceNotFound;
         var path_buf: [256]u8 = undefined;
         const path = std.fmt.bufPrint(&path_buf, "/api/v1/payments/{s}", .{payment_hash}) catch return LnbitsError.RequestFailed;
 
@@ -133,10 +136,11 @@ pub const Client = struct {
         const uri = std.Uri.parse(uri_str) catch return LnbitsError.RequestFailed;
 
         var req = self.http_client.request(method, uri, .{
+            .headers = .{ .accept_encoding = .omit, .content_type = .{ .override = "application/json" } },
             .extra_headers = &.{
                 .{ .name = "X-Api-Key", .value = self.admin_key },
-                .{ .name = "Content-Type", .value = "application/json" },
             },
+            .redirect_behavior = .unhandled,
         }) catch return LnbitsError.RequestFailed;
         defer req.deinit();
 
@@ -154,11 +158,19 @@ pub const Client = struct {
             return LnbitsError.RequestFailed;
         }
 
-        var body_reader = response.reader(response_buf);
+        var transfer_buf: [4096]u8 = undefined;
+        const body_reader = response.reader(&transfer_buf);
         const len = body_reader.readSliceShort(response_buf) catch return LnbitsError.RequestFailed;
+        if (len == response_buf.len) return LnbitsError.InvalidResponse;
         return response_buf[0..len];
     }
 };
+
+pub fn isPaymentHash(value: []const u8) bool {
+    if (value.len != 64) return false;
+    for (value) |c| if (!std.ascii.isHex(c)) return false;
+    return true;
+}
 
 fn extractJsonString(json: []const u8, key: []const u8) ?[]const u8 {
     var search_buf: [68]u8 = undefined;
@@ -211,4 +223,20 @@ fn extractJsonBool(json: []const u8, key: []const u8) ?bool {
     if (pos + 4 <= json.len and std.mem.eql(u8, json[pos..][0..4], "true")) return true;
     if (pos + 5 <= json.len and std.mem.eql(u8, json[pos..][0..5], "false")) return false;
     return null;
+}
+
+test "payment hash validation" {
+    var hash: [64]u8 = @splat('a');
+    try std.testing.expect(isPaymentHash(&hash));
+    try std.testing.expect(!isPaymentHash(hash[0..63]));
+    try std.testing.expect(!isPaymentHash("../wallet"));
+    hash[62] = '/';
+    try std.testing.expect(!isPaymentHash(&hash));
+}
+
+test "createInvoice rejects amounts that are not whole sats" {
+    var client = Client.init(std.testing.allocator, std.testing.io, "http://127.0.0.1:1", "key");
+    defer client.deinit();
+    try std.testing.expectError(LnbitsError.InvalidAmount, client.createInvoice(0, null));
+    try std.testing.expectError(LnbitsError.InvalidAmount, client.createInvoice(1500, null));
 }

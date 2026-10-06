@@ -1,6 +1,7 @@
 const std = @import("std");
 const nostr = @import("nostr");
 const ws = nostr.ws;
+const utils = nostr.utils;
 
 const log = std.log.scoped(.relay);
 
@@ -36,11 +37,10 @@ pub const Relay = struct {
     client: ws.Client,
 
     pub fn connect(allocator: std.mem.Allocator, url: []const u8) !Relay {
-        var client = ws.Client.connect(allocator, url) catch |err| {
+        const client = ws.Client.connect(allocator, url) catch |err| {
             log.err("WebSocket connection failed: {}", .{err});
             return RelayError.ConnectionFailed;
         };
-        errdefer client.close();
 
         return .{
             .allocator = allocator,
@@ -53,44 +53,25 @@ pub const Relay = struct {
         self.client.close();
     }
 
+    pub fn socket(self: *const Relay) std.posix.fd_t {
+        return self.client.tcp_stream.socket.handle;
+    }
+
     pub fn send(self: *Relay, data: []const u8) !void {
         self.client.sendText(data) catch return RelayError.SendFailed;
     }
 
-    pub fn receive(self: *Relay) !?Message {
+    pub fn receive(self: *Relay) !Message {
         const msg = self.client.recvMessage() catch |err| {
-            if (err == error.EndOfStream or err == error.ConnectionResetByPeer) {
-                return RelayError.Closed;
-            }
-            return null;
+            log.warn("Receive failed: {}", .{err});
+            return RelayError.Closed;
         };
-
-        const result = parseMessage(msg.payload, self.allocator) catch |err| {
-            msg.deinit();
-            return err;
-        };
-        msg.deinit();
-        return result;
+        defer msg.deinit();
+        return parseMessage(msg.payload, self.allocator);
     }
 
     pub fn freeMessage(self: *Relay, message: *Message) void {
-        switch (message.*) {
-            .event => |e| {
-                self.allocator.free(e.subscription_id);
-                self.allocator.free(e.event_json);
-            },
-            .ok => |o| {
-                self.allocator.free(o.event_id);
-                self.allocator.free(o.message);
-            },
-            .eose => |s| self.allocator.free(s),
-            .notice => |s| self.allocator.free(s),
-            .closed => |c| {
-                self.allocator.free(c.subscription_id);
-                self.allocator.free(c.message);
-            },
-            .unknown => {},
-        }
+        freeMessageWith(self.allocator, message);
     }
 
     pub fn publish(self: *Relay, event_json: []const u8) !void {
@@ -112,122 +93,127 @@ pub const Relay = struct {
     }
 };
 
-fn parseMessage(data: []const u8, allocator: std.mem.Allocator) !Message {
-    if (data.len < 5) return .unknown;
-    if (data[0] != '[') return .unknown;
+fn freeMessageWith(allocator: std.mem.Allocator, message: *Message) void {
+    switch (message.*) {
+        .event => |e| {
+            allocator.free(e.subscription_id);
+            allocator.free(e.event_json);
+        },
+        .ok => |o| {
+            allocator.free(o.event_id);
+            allocator.free(o.message);
+        },
+        .eose => |s| allocator.free(s),
+        .notice => |s| allocator.free(s),
+        .closed => |c| {
+            allocator.free(c.subscription_id);
+            allocator.free(c.message);
+        },
+        .unknown => {},
+    }
+}
 
-    const type_start = std.mem.indexOf(u8, data, "\"") orelse return .unknown;
-    const type_end = std.mem.indexOfPos(u8, data, type_start + 1, "\"") orelse return .unknown;
-    const msg_type = data[type_start + 1 .. type_end];
+fn stringElement(data: []const u8, index: usize) ?[]const u8 {
+    const elem = utils.findArrayElement(data, index) orelse return null;
+    const trimmed = std.mem.trim(u8, elem, " \t\r\n");
+    if (trimmed.len < 2 or trimmed[0] != '"' or trimmed[trimmed.len - 1] != '"') return null;
+    return trimmed[1 .. trimmed.len - 1];
+}
+
+fn parseMessage(data: []const u8, allocator: std.mem.Allocator) !Message {
+    const trimmed = std.mem.trim(u8, data, " \t\r\n");
+    if (trimmed.len == 0 or trimmed[0] != '[') return .unknown;
+    const msg_type = stringElement(trimmed, 0) orelse return .unknown;
 
     if (std.mem.eql(u8, msg_type, "EVENT")) {
-        var pos = type_end + 1;
-        while (pos < data.len and (data[pos] == ',' or data[pos] == ' ' or data[pos] == '"')) : (pos += 1) {}
-        const sub_start = pos;
-        while (pos < data.len and data[pos] != '"') : (pos += 1) {}
-        const sub_id = data[sub_start..pos];
+        const sub_id = stringElement(trimmed, 1) orelse return .unknown;
+        const raw_event = utils.findArrayElement(trimmed, 2) orelse return .unknown;
+        const event_json = std.mem.trim(u8, raw_event, " \t\r\n");
+        if (event_json.len == 0 or event_json[0] != '{') return .unknown;
+        if (utils.skipJsonValue(event_json, 0) != event_json.len) return .unknown;
 
-        pos += 1;
-        while (pos < data.len and (data[pos] == ',' or data[pos] == ' ')) : (pos += 1) {}
-
-        if (pos < data.len and data[pos] == '{') {
-            var depth: usize = 0;
-            const event_start = pos;
-            while (pos < data.len) : (pos += 1) {
-                if (data[pos] == '{') depth += 1;
-                if (data[pos] == '}') {
-                    depth -= 1;
-                    if (depth == 0) {
-                        const sub_id_copy = try allocator.dupe(u8, sub_id);
-                        errdefer allocator.free(sub_id_copy);
-                        const event_json_copy = try allocator.dupe(u8, data[event_start .. pos + 1]);
-                        return .{ .event = .{
-                            .subscription_id = sub_id_copy,
-                            .event_json = event_json_copy,
-                        } };
-                    }
-                }
-            }
-        }
-        return .unknown;
+        const sub_id_copy = try allocator.dupe(u8, sub_id);
+        errdefer allocator.free(sub_id_copy);
+        return .{ .event = .{
+            .subscription_id = sub_id_copy,
+            .event_json = try allocator.dupe(u8, event_json),
+        } };
     }
 
     if (std.mem.eql(u8, msg_type, "OK")) {
-        var pos = type_end + 1;
-        while (pos < data.len and (data[pos] == ',' or data[pos] == ' ' or data[pos] == '"')) : (pos += 1) {}
-        const id_start = pos;
-        while (pos < data.len and data[pos] != '"') : (pos += 1) {}
-        const event_id = data[id_start..pos];
-
-        while (pos < data.len and data[pos] != 't' and data[pos] != 'f') : (pos += 1) {}
-        const success = pos < data.len and data[pos] == 't';
-
-        var message: []const u8 = "";
-        if (std.mem.lastIndexOf(u8, data, "\"")) |last_quote| {
-            if (lastIndexOfBefore(data, '"', last_quote)) |second_last| {
-                message = data[second_last + 1 .. last_quote];
-            }
-        }
+        const event_id = stringElement(trimmed, 1) orelse return .unknown;
+        const success_raw = utils.findArrayElement(trimmed, 2) orelse return .unknown;
+        const message = stringElement(trimmed, 3) orelse "";
 
         const event_id_copy = try allocator.dupe(u8, event_id);
         errdefer allocator.free(event_id_copy);
-        const message_copy = try allocator.dupe(u8, message);
         return .{ .ok = .{
             .event_id = event_id_copy,
-            .success = success,
-            .message = message_copy,
+            .success = std.mem.eql(u8, std.mem.trim(u8, success_raw, " \t\r\n"), "true"),
+            .message = try allocator.dupe(u8, message),
         } };
     }
 
     if (std.mem.eql(u8, msg_type, "EOSE")) {
-        var pos = type_end + 1;
-        while (pos < data.len and (data[pos] == ',' or data[pos] == ' ' or data[pos] == '"')) : (pos += 1) {}
-        const sub_start = pos;
-        while (pos < data.len and data[pos] != '"') : (pos += 1) {}
-        return .{ .eose = try allocator.dupe(u8, data[sub_start..pos]) };
+        return .{ .eose = try allocator.dupe(u8, stringElement(trimmed, 1) orelse return .unknown) };
     }
 
     if (std.mem.eql(u8, msg_type, "NOTICE")) {
-        if (std.mem.lastIndexOf(u8, data, "\"")) |last_quote| {
-            if (lastIndexOfBefore(data, '"', last_quote)) |second_last| {
-                return .{ .notice = try allocator.dupe(u8, data[second_last + 1 .. last_quote]) };
-            }
-        }
-        return .unknown;
+        return .{ .notice = try allocator.dupe(u8, stringElement(trimmed, 1) orelse return .unknown) };
     }
 
     if (std.mem.eql(u8, msg_type, "CLOSED")) {
-        var pos = type_end + 1;
-        while (pos < data.len and (data[pos] == ',' or data[pos] == ' ' or data[pos] == '"')) : (pos += 1) {}
-        const sub_start = pos;
-        while (pos < data.len and data[pos] != '"') : (pos += 1) {}
-        const sub_id = data[sub_start..pos];
-
-        var message: []const u8 = "";
-        if (std.mem.lastIndexOf(u8, data, "\"")) |last_quote| {
-            if (lastIndexOfBefore(data, '"', last_quote)) |second_last| {
-                message = data[second_last + 1 .. last_quote];
-            }
-        }
+        const sub_id = stringElement(trimmed, 1) orelse return .unknown;
+        const message = stringElement(trimmed, 2) orelse "";
 
         const sub_id_copy = try allocator.dupe(u8, sub_id);
         errdefer allocator.free(sub_id_copy);
-        const message_copy = try allocator.dupe(u8, message);
         return .{ .closed = .{
             .subscription_id = sub_id_copy,
-            .message = message_copy,
+            .message = try allocator.dupe(u8, message),
         } };
     }
 
     return .unknown;
 }
 
-fn lastIndexOfBefore(data: []const u8, needle: u8, before: usize) ?usize {
-    if (before == 0) return null;
-    var i = before - 1;
-    while (true) {
-        if (data[i] == needle) return i;
-        if (i == 0) return null;
-        i -= 1;
-    }
+test "parse EVENT keeps braces inside strings" {
+    const allocator = std.testing.allocator;
+    const data =
+        \\["EVENT","nwc",{"id":"x","tags":[["t","}{"]],"content":"a}b"}]
+    ;
+    var msg = try parseMessage(data, allocator);
+    defer freeMessageWith(allocator, &msg);
+    try std.testing.expectEqualStrings("nwc", msg.event.subscription_id);
+    try std.testing.expectEqualStrings(
+        \\{"id":"x","tags":[["t","}{"]],"content":"a}b"}
+    , msg.event.event_json);
+}
+
+test "parse OK, EOSE, NOTICE and CLOSED" {
+    const allocator = std.testing.allocator;
+
+    var ok = try parseMessage("[\"OK\",\"abc\",false,\"blocked: no\"]", allocator);
+    defer freeMessageWith(allocator, &ok);
+    try std.testing.expect(!ok.ok.success);
+    try std.testing.expectEqualStrings("blocked: no", ok.ok.message);
+
+    var eose = try parseMessage("[\"EOSE\",\"nwc\"]", allocator);
+    defer freeMessageWith(allocator, &eose);
+    try std.testing.expectEqualStrings("nwc", eose.eose);
+
+    var notice = try parseMessage("[\"NOTICE\",\"hi\"]", allocator);
+    defer freeMessageWith(allocator, &notice);
+    try std.testing.expectEqualStrings("hi", notice.notice);
+
+    var closed = try parseMessage("[\"CLOSED\",\"nwc\",\"error: x\"]", allocator);
+    defer freeMessageWith(allocator, &closed);
+    try std.testing.expectEqualStrings("error: x", closed.closed.message);
+}
+
+test "malformed EVENT is unknown" {
+    const allocator = std.testing.allocator;
+    var msg = try parseMessage("[\"EVENT\",\"nwc\",{\"id\":\"x\"", allocator);
+    defer freeMessageWith(allocator, &msg);
+    try std.testing.expect(msg == .unknown);
 }
