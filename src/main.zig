@@ -2,6 +2,7 @@ const std = @import("std");
 const nostr = @import("nostr");
 const Config = @import("config.zig").Config;
 const LnbitsClient = @import("lnbits.zig").Client;
+const bolt11 = @import("bolt11.zig");
 const Relay = @import("relay.zig").Relay;
 
 const nwc = nostr.nwc;
@@ -18,6 +19,10 @@ const supported_methods = [_]nwc.Method{
 /// Requests older than this are ignored, and request ids are remembered for at
 /// least this long, so a captured request cannot be replayed to run twice.
 const max_request_age_s: i64 = 600;
+
+/// The replay cache does not survive a restart, so requests created more than
+/// this long before the process started are ignored.
+const start_skew_s: i64 = 60;
 
 var g_shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 var g_relay_fd: std.atomic.Value(std.posix.fd_t) = std.atomic.Value(std.posix.fd_t).init(-1);
@@ -48,8 +53,9 @@ pub fn main(init: std.process.Init) !void {
     var pubkey_hex: [64]u8 = undefined;
     nostr.hex.encode(&config.pubkey, &pubkey_hex);
     std.log.info("Pubkey: {s}", .{&pubkey_hex});
-    std.log.info("Relay: {s}", .{config.relay});
-    std.log.info("LNbits: {s}", .{config.lnbits_host});
+    var url_buf: [512]u8 = undefined;
+    std.log.info("Relay: {s}", .{redactUserinfo(config.relay, &url_buf)});
+    std.log.info("LNbits: {s}", .{redactUserinfo(config.lnbits_host, &url_buf)});
     std.log.info("Authorized client pubkeys: {d}", .{config.client_pubkeys.items.len});
 
     const sa = std.posix.Sigaction{
@@ -70,7 +76,7 @@ pub fn main(init: std.process.Init) !void {
     var lnbits = LnbitsClient.init(allocator, io, config.lnbits_host, config.lnbits_admin_key);
     defer lnbits.deinit();
 
-    var guard: ReplayGuard = .{};
+    var guard: ReplayGuard = .{ .not_before = nostr.io.timestamp() - start_skew_s };
     defer guard.deinit(allocator);
 
     while (!g_shutdown.load(.acquire)) {
@@ -87,6 +93,14 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("Shutdown complete", .{});
 }
 
+/// `url` with any userinfo (`user:password@`) replaced, for logging.
+fn redactUserinfo(url: []const u8, buf: []u8) []const u8 {
+    const authority_start = (std.mem.indexOf(u8, url, "://") orelse return url) + 3;
+    const authority_end = std.mem.indexOfAnyPos(u8, url, authority_start, "/?#") orelse url.len;
+    const at = std.mem.lastIndexOfScalar(u8, url[authority_start..authority_end], '@') orelse return url;
+    return std.fmt.bufPrint(buf, "{s}***@{s}", .{ url[0..authority_start], url[authority_start + at + 1 ..] }) catch "<redacted>";
+}
+
 fn runEventLoop(allocator: std.mem.Allocator, config: *Config, lnbits: *LnbitsClient, guard: *ReplayGuard) !void {
     std.log.info("Connecting to relay...", .{});
     var relay = try Relay.connect(allocator, config.relay);
@@ -100,7 +114,7 @@ fn runEventLoop(allocator: std.mem.Allocator, config: *Config, lnbits: *LnbitsCl
     try publishInfoEvent(config, &relay);
 
     var filter_buf: [4096]u8 = undefined;
-    const filter = try buildRequestFilter(config, nostr.io.timestamp(), &filter_buf);
+    const filter = try buildRequestFilter(config, @max(nostr.io.timestamp() - max_request_age_s, guard.not_before), &filter_buf);
 
     try relay.subscribe("nwc", filter);
     std.log.info("Subscribed to NWC requests", .{});
@@ -130,7 +144,7 @@ fn runEventLoop(allocator: std.mem.Allocator, config: *Config, lnbits: *LnbitsCl
     }
 }
 
-fn buildRequestFilter(config: *const Config, now: i64, buf: []u8) ![]const u8 {
+fn buildRequestFilter(config: *const Config, since: i64, buf: []u8) ![]const u8 {
     var w = std.Io.Writer.fixed(buf);
     var hex_buf: [64]u8 = undefined;
     nostr.hex.encode(&config.pubkey, &hex_buf);
@@ -140,7 +154,7 @@ fn buildRequestFilter(config: *const Config, now: i64, buf: []u8) ![]const u8 {
         nostr.hex.encode(pk, &hex_buf);
         try w.print("\"{s}\"", .{&hex_buf});
     }
-    try w.print("],\"since\":{d}}}", .{now - max_request_age_s});
+    try w.print("],\"since\":{d}}}", .{since});
     return w.buffered();
 }
 
@@ -158,10 +172,11 @@ fn publishInfoEvent(config: *Config, relay: *Relay) !void {
     }
     const content = content_buf[0..content_pos];
 
-    const keypair = nostr.Keypair{
+    var keypair = nostr.Keypair{
         .secret_key = config.privkey,
         .public_key = config.pubkey,
     };
+    defer std.crypto.secureZero(u8, &keypair.secret_key);
 
     const tags = [_][]const []const u8{
         &[_][]const u8{ "encryption", nwc.Encryption.nip44_v2.toString() },
@@ -185,12 +200,14 @@ const RequestError = error{
     InvalidSignature,
     Expired,
     Stale,
+    BeforeStart,
 };
 
 /// Checks run before a request is decrypted: it must be a kind 23194 event
 /// addressed to this wallet service, authored by a configured client key,
-/// correctly signed, unexpired (NIP-47 `expiration` tag) and recent.
-fn checkRequest(config: *const Config, event: *const nostr.Event, now: i64) RequestError!void {
+/// correctly signed, unexpired (NIP-47 `expiration` tag), recent, and not
+/// created before `not_before` (shortly before this process started).
+fn checkRequest(config: *const Config, event: *const nostr.Event, now: i64, not_before: i64) RequestError!void {
     if (event.kind() != nwc.Kind.request) return error.WrongKind;
     if (!config.isAuthorized(event.pubkey())) return error.Unauthorized;
 
@@ -219,6 +236,7 @@ fn checkRequest(config: *const Config, event: *const nostr.Event, now: i64) Requ
 
     if (expired) return error.Expired;
     if (event.createdAt() < now - max_request_age_s) return error.Stale;
+    if (event.createdAt() < not_before) return error.BeforeStart;
 }
 
 /// NIP-47: a request without an `encryption` tag uses NIP-04.
@@ -238,6 +256,8 @@ fn requestEncryption(event: *const nostr.Event) error{UnsupportedEncryption}!nwc
 // Linear scan; only authorized, signed requests are recorded, so it stays small.
 const ReplayGuard = struct {
     entries: std.ArrayListUnmanaged(Entry) = .empty,
+    /// Process start minus `start_skew_s`; earlier requests may predate the cache.
+    not_before: i64,
 
     const Entry = struct { id: [32]u8, created_at: i64 };
 
@@ -270,7 +290,7 @@ fn handleEvent(allocator: std.mem.Allocator, config: *Config, lnbits: *LnbitsCli
     nostr.hex.encode(&event.id_bytes, &id_hex);
 
     const now = nostr.io.timestamp();
-    checkRequest(config, &event, now) catch |err| {
+    checkRequest(config, &event, now, guard.not_before) catch |err| {
         std.log.warn("Ignoring request {s}: {}", .{ &id_hex, err });
         return;
     };
@@ -279,19 +299,32 @@ fn handleEvent(allocator: std.mem.Allocator, config: *Config, lnbits: *LnbitsCli
         return;
     }
 
+    const sender_pubkey = event.pubkey();
+    var event_buf: [32768]u8 = undefined;
+
     const encryption = requestEncryption(&event) catch {
-        std.log.warn("Ignoring request {s}: unsupported encryption", .{&id_hex});
+        std.log.warn("Request {s}: unsupported encryption", .{&id_hex});
+        // The method is unreadable, so result_type stays empty; the reply uses
+        // the only scheme the info event advertises.
+        const response_event = try buildResponseEvent(allocator, config, sender_pubkey, &event.id_bytes, unsupported_encryption_response, .nip44_v2, &event_buf);
+        try relay.publish(response_event);
         return;
     };
 
-    const sender_pubkey = event.pubkey();
     const decrypted = decrypt(allocator, config, sender_pubkey, event.content(), encryption) catch |err| {
         std.log.err("Decryption failed: {}", .{err});
         return;
     };
-    defer allocator.free(decrypted);
+    defer {
+        std.crypto.secureZero(u8, decrypted);
+        allocator.free(decrypted);
+    }
 
-    var response_buf: [4096]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var response_buf: [16384]u8 = undefined;
+    defer std.crypto.secureZero(u8, &response_buf);
     const response_json = switch (encryption) {
         .nip04 => blk: {
             const method = nwc.Method.fromString(utils.extractJsonString(decrypted, "method") orelse return) orelse return;
@@ -303,18 +336,19 @@ fn handleEvent(allocator: std.mem.Allocator, config: *Config, lnbits: *LnbitsCli
         },
         .nip44_v2 => if (nwc.Request.parseJson(decrypted)) |request| blk: {
             std.log.info("Received {s} request", .{request.method.toString()});
-            break :blk try handleRequest(request, utils.findJsonValue(decrypted, "params") orelse "{}", lnbits, &response_buf);
+            break :blk try handleRequest(arena.allocator(), request, utils.findJsonValue(decrypted, "params") orelse "{}", lnbits, &response_buf);
         } else serializeInvalidRequest(decrypted, &response_buf) orelse {
             std.log.err("Failed to parse NWC request", .{});
             return;
         },
     };
 
-    var event_buf: [16384]u8 = undefined;
     const response_event = try buildResponseEvent(allocator, config, sender_pubkey, &event.id_bytes, response_json, encryption, &event_buf);
     try relay.publish(response_event);
     std.log.debug("Published response", .{});
 }
+
+const unsupported_encryption_response = "{\"result_type\":\"\",\"error\":{\"code\":\"UNSUPPORTED_ENCRYPTION\",\"message\":\"Use nip44_v2 encryption\"},\"result\":null}";
 
 fn decrypt(allocator: std.mem.Allocator, config: *const Config, sender: *const [32]u8, content: []const u8, encryption: nwc.Encryption) ![]u8 {
     return switch (encryption) {
@@ -371,13 +405,16 @@ fn bolt11AmountMsat(invoice: []const u8) error{InvalidInvoice}!?u64 {
     return std.math.mul(u64, n, msat_per_unit) catch error.InvalidInvoice;
 }
 
+fn isAlphanumeric(s: []const u8) bool {
+    for (s) |c| if (!std.ascii.isAlphanumeric(c)) return false;
+    return true;
+}
+
 /// Rejects a pay_invoice request whose amount could be read differently by the
 /// client and by the wallet: a malformed `amount`, an amount that differs from
 /// the invoice's, or an amountless invoice (LNbits is never sent `amount`).
 fn checkPayInvoice(params_json: []const u8, params: nwc.Request.PayInvoice) ?nwc.Response.Error {
-    for (params.invoice) |c| {
-        if (!std.ascii.isAlphanumeric(c)) return .{ .code = .other, .message = "Invalid invoice" };
-    }
+    if (!isAlphanumeric(params.invoice)) return .{ .code = .other, .message = "Invalid invoice" };
 
     if (utils.findJsonFieldStart(params_json, "amount")) |start| {
         if (params.amount == null and !std.mem.startsWith(u8, params_json[start..], "null")) {
@@ -394,19 +431,24 @@ fn checkPayInvoice(params_json: []const u8, params: nwc.Request.PayInvoice) ?nwc
     return null;
 }
 
-fn handleRequest(request: nwc.Request, params_json: []const u8, lnbits: *LnbitsClient, buf: []u8) ![]u8 {
+/// Response to a pay_invoice whose outcome LNbits could not confirm. Not
+/// PAYMENT_FAILED: the payment may still complete, so a blind retry could pay twice.
+const payment_unknown_message = "Payment status unknown, it may still complete; check lookup_invoice before retrying";
+
+fn handleRequest(arena: std.mem.Allocator, request: nwc.Request, params_json: []const u8, lnbits: *LnbitsClient, buf: []u8) ![]u8 {
     var response: nwc.Response = .{ .result_type = request.method };
+    var preimage_hex: [64]u8 = undefined;
 
     switch (request.params) {
         .get_balance => {
-            const wallet = lnbits.getWallet() catch {
+            const wallet = lnbits.getWallet(arena) catch {
                 response.err = .{ .code = .internal, .message = "Failed to get balance" };
                 return response.serialize(buf);
             };
             response.result = .{ .get_balance = .{ .balance = wallet.balance } };
         },
         .get_info => {
-            const wallet = lnbits.getWallet() catch {
+            const wallet = lnbits.getWallet(arena) catch {
                 response.err = .{ .code = .internal, .message = "Failed to get wallet info" };
                 return response.serialize(buf);
             };
@@ -421,7 +463,7 @@ fn handleRequest(request: nwc.Request, params_json: []const u8, lnbits: *LnbitsC
                 response.err = .{ .code = .other, .message = "Amount must be a positive whole number of sats" };
                 return response.serialize(buf);
             }
-            const invoice = lnbits.createInvoice(params.amount, params.description) catch {
+            const invoice = lnbits.createInvoice(arena, params.amount, params.description) catch {
                 response.err = .{ .code = .internal, .message = "Failed to create invoice" };
                 return response.serialize(buf);
             };
@@ -441,23 +483,31 @@ fn handleRequest(request: nwc.Request, params_json: []const u8, lnbits: *LnbitsC
                 return response.serialize(buf);
             }
 
-            const result = lnbits.payInvoice(params.invoice) catch {
-                response.err = .{ .code = .payment_failed, .message = "Payment failed" };
+            const payment_hash = bolt11.paymentHash(params.invoice) catch {
+                response.err = .{ .code = .other, .message = "Invalid invoice" };
                 return response.serialize(buf);
             };
 
-            const details = lnbits.lookupPayment(result.payment_hash) catch {
-                response.result = .{ .pay_invoice = .{
-                    .preimage = "",
-                    .fees_paid = null,
-                } };
-                return response.serialize(buf);
-            };
-
-            response.result = .{ .pay_invoice = .{
-                .preimage = details.preimage,
-                .fees_paid = if (details.fee != 0) @abs(details.fee) else null,
-            } };
+            switch (try lnbits.payInvoice(arena, params.invoice, &payment_hash)) {
+                .paid => |paid| {
+                    const preimage: []const u8 = if (paid.preimage) |p| blk: {
+                        preimage_hex = std.fmt.bytesToHex(&p, .lower);
+                        break :blk &preimage_hex;
+                    } else blk: {
+                        std.log.warn("Payment succeeded but LNbits returned no matching preimage", .{});
+                        break :blk "";
+                    };
+                    response.result = .{ .pay_invoice = .{
+                        .preimage = preimage,
+                        .fees_paid = paid.fee_msat,
+                    } };
+                },
+                .failed => |reason| response.err = .{
+                    .code = .payment_failed,
+                    .message = try std.fmt.allocPrint(arena, "Payment failed: {s}", .{reason}),
+                },
+                .unknown => response.err = .{ .code = .internal, .message = payment_unknown_message },
+            }
         },
         .lookup_invoice => |params| {
             const hash = params.payment_hash orelse {
@@ -465,22 +515,29 @@ fn handleRequest(request: nwc.Request, params_json: []const u8, lnbits: *LnbitsC
                 return response.serialize(buf);
             };
 
-            const details = lnbits.lookupPayment(hash) catch {
+            const details = lnbits.lookupPayment(arena, hash) catch {
                 response.err = .{ .code = .not_found, .message = "Invoice not found" };
                 return response.serialize(buf);
             };
 
-            const state: nwc.TransactionState = if (details.pending) .pending else .settled;
-            response.result = .{ .lookup_invoice = .{
-                .tx_type = if (details.amount > 0) .incoming else .outgoing,
-                .state = state,
-                .invoice = if (details.bolt11.len > 0) details.bolt11 else null,
-                .payment_hash = details.payment_hash,
-                .preimage = if (details.preimage.len > 0) details.preimage else null,
-                .amount = if (details.amount != 0) @abs(details.amount) else null,
-                .fees_paid = if (details.fee != 0) @abs(details.fee) else null,
-                .description = if (details.memo.len > 0) details.memo else null,
-            } };
+            const incoming = if (details.amount_msat) |a| a > 0 else false;
+            response.result = .{
+                .lookup_invoice = .{
+                    .tx_type = if (incoming) .incoming else .outgoing,
+                    .state = switch (details.state) {
+                        .paid => .settled,
+                        .failed => if (incoming) .expired else .failed,
+                        .pending => .pending,
+                    },
+                    // libnostr-z writes the invoice unescaped.
+                    .invoice = if (details.bolt11) |b| if (isAlphanumeric(b)) b else null else null,
+                    .payment_hash = hash,
+                    .preimage = if (details.preimage) |p| try arena.dupe(u8, &std.fmt.bytesToHex(&p, .lower)) else null,
+                    .amount = if (details.amount_msat) |a| if (a != 0) @abs(a) else null else null,
+                    .fees_paid = details.fee_msat,
+                    .description = if (details.memo) |m| if (m.len > 0) m else null else null,
+                },
+            };
         },
         else => {
             response.err = .{ .code = .not_implemented, .message = "Method not supported" };
@@ -507,10 +564,11 @@ fn buildResponseEvent(
     };
     defer allocator.free(encrypted);
 
-    const keypair = nostr.Keypair{
+    var keypair = nostr.Keypair{
         .secret_key = config.privkey,
         .public_key = config.pubkey,
     };
+    defer std.crypto.secureZero(u8, &keypair.secret_key);
 
     var p_tag_hex: [64]u8 = undefined;
     nostr.hex.encode(recipient_pubkey, &p_tag_hex);
@@ -531,6 +589,7 @@ fn buildResponseEvent(
 }
 
 test {
+    _ = @import("bolt11.zig");
     _ = @import("config.zig");
     _ = @import("lnbits.zig");
     _ = @import("relay.zig");
@@ -602,7 +661,7 @@ test "checkRequest accepts a signed request from an authorized client" {
 
     var event = try nostr.Event.parseWithAllocator(signed.json, testing.allocator);
     defer event.deinit();
-    try checkRequest(&keys.config, &event, now);
+    try checkRequest(&keys.config, &event, now, 0);
 }
 
 test "checkRequest rejects an unauthorized author" {
@@ -617,7 +676,7 @@ test "checkRequest rejects an unauthorized author" {
 
     var event = try nostr.Event.parseWithAllocator(signed.json, testing.allocator);
     defer event.deinit();
-    try testing.expectError(error.Unauthorized, checkRequest(&keys.config, &event, now));
+    try testing.expectError(error.Unauthorized, checkRequest(&keys.config, &event, now, 0));
 }
 
 test "checkRequest rejects a forged signature" {
@@ -642,7 +701,7 @@ test "checkRequest rejects a forged signature" {
 
     var event = try nostr.Event.parseWithAllocator(tampered, testing.allocator);
     defer event.deinit();
-    try testing.expectError(error.InvalidSignature, checkRequest(&keys.config, &event, now));
+    try testing.expectError(error.InvalidSignature, checkRequest(&keys.config, &event, now, 0));
 }
 
 test "checkRequest rejects requests not addressed to this wallet" {
@@ -657,7 +716,7 @@ test "checkRequest rejects requests not addressed to this wallet" {
 
     var event = try nostr.Event.parseWithAllocator(signed.json, testing.allocator);
     defer event.deinit();
-    try testing.expectError(error.NotAddressedToUs, checkRequest(&keys.config, &event, now));
+    try testing.expectError(error.NotAddressedToUs, checkRequest(&keys.config, &event, now, 0));
 }
 
 test "checkRequest rejects expired, malformed-expiration and stale requests" {
@@ -674,14 +733,14 @@ test "checkRequest rejects expired, malformed-expiration and stale requests" {
     try signRequest(&expired, &keys.client, &expired_tags, now, "x");
     var expired_event = try nostr.Event.parseWithAllocator(expired.json, testing.allocator);
     defer expired_event.deinit();
-    try testing.expectError(error.Expired, checkRequest(&keys.config, &expired_event, now));
+    try testing.expectError(error.Expired, checkRequest(&keys.config, &expired_event, now, 0));
 
     const bad_tags = [_][]const []const u8{ &.{ "p", &wallet_hex }, &.{ "expiration", "soon" } };
     var bad: SignedEvent = .{};
     try signRequest(&bad, &keys.client, &bad_tags, now, "x");
     var bad_event = try nostr.Event.parseWithAllocator(bad.json, testing.allocator);
     defer bad_event.deinit();
-    try testing.expectError(error.Expired, checkRequest(&keys.config, &bad_event, now));
+    try testing.expectError(error.Expired, checkRequest(&keys.config, &bad_event, now, 0));
 
     var future_buf: [20]u8 = undefined;
     const future = try std.fmt.bufPrint(&future_buf, "{d}", .{now + 60});
@@ -690,13 +749,44 @@ test "checkRequest rejects expired, malformed-expiration and stale requests" {
     try signRequest(&stale, &keys.client, &live_tags, now - max_request_age_s - 1, "x");
     var stale_event = try nostr.Event.parseWithAllocator(stale.json, testing.allocator);
     defer stale_event.deinit();
-    try testing.expectError(error.Stale, checkRequest(&keys.config, &stale_event, now));
+    try testing.expectError(error.Stale, checkRequest(&keys.config, &stale_event, now, 0));
 
     var live: SignedEvent = .{};
     try signRequest(&live, &keys.client, &live_tags, now, "x");
     var live_event = try nostr.Event.parseWithAllocator(live.json, testing.allocator);
     defer live_event.deinit();
-    try checkRequest(&keys.config, &live_event, now);
+    try checkRequest(&keys.config, &live_event, now, 0);
+}
+
+test "checkRequest rejects requests created before the process started" {
+    var keys = try TestKeys.init();
+    defer keys.deinit();
+
+    const now = nostr.io.timestamp();
+    const not_before = now - start_skew_s;
+    const wallet_hex = hexOf(&keys.wallet.public_key);
+    const tags = [_][]const []const u8{&.{ "p", &wallet_hex }};
+
+    var old: SignedEvent = .{};
+    try signRequest(&old, &keys.client, &tags, not_before - 1, "x");
+    var old_event = try nostr.Event.parseWithAllocator(old.json, testing.allocator);
+    defer old_event.deinit();
+    try testing.expectError(error.BeforeStart, checkRequest(&keys.config, &old_event, now, not_before));
+    try checkRequest(&keys.config, &old_event, now, not_before - 1);
+
+    var fresh: SignedEvent = .{};
+    try signRequest(&fresh, &keys.client, &tags, not_before, "x");
+    var fresh_event = try nostr.Event.parseWithAllocator(fresh.json, testing.allocator);
+    defer fresh_event.deinit();
+    try checkRequest(&keys.config, &fresh_event, now, not_before);
+}
+
+test "redactUserinfo hides credentials in URLs" {
+    var buf: [128]u8 = undefined;
+    try testing.expectEqualStrings("https://***@lnbits.example/api", redactUserinfo("https://user:pass@lnbits.example/api", &buf));
+    try testing.expectEqualStrings("http://***@127.0.0.1:5000", redactUserinfo("http://a@b@127.0.0.1:5000", &buf));
+    try testing.expectEqualStrings("http://127.0.0.1:5000/x?y=a@b", redactUserinfo("http://127.0.0.1:5000/x?y=a@b", &buf));
+    try testing.expectEqualStrings("lnbits.local", redactUserinfo("lnbits.local", &buf));
 }
 
 test "requestEncryption follows the NIP-47 encryption tag" {
@@ -725,7 +815,7 @@ test "requestEncryption follows the NIP-47 encryption tag" {
 }
 
 test "ReplayGuard rejects a repeated id and forgets expired ones" {
-    var guard: ReplayGuard = .{};
+    var guard: ReplayGuard = .{ .not_before = 0 };
     defer guard.deinit(testing.allocator);
 
     const id: [32]u8 = @splat(7);
@@ -825,12 +915,16 @@ test "handleRequest rejects invalid make_invoice amounts without calling LNbits"
     var buf: [1024]u8 = undefined;
     for ([_]u64{ 0, 1500, 999 }) |amount| {
         const request = nwc.Request{ .method = .make_invoice, .params = .{ .make_invoice = .{ .amount = amount } } };
-        const json = try handleRequest(request, "{}", &lnbits, &buf);
+        const json = try handleRequest(testing.allocator, request, "{}", &lnbits, &buf);
         const parsed = nwc.Response.parseJson(json).?;
         try testing.expectEqual(nwc.ErrorCode.other, parsed.err.?.code);
     }
 
     const pay = nwc.Request{ .method = .pay_invoice, .params = .{ .pay_invoice = .{ .invoice = "lnbc50n1pdummy", .amount = 1 } } };
-    const pay_json = try handleRequest(pay, "{\"invoice\":\"lnbc50n1pdummy\",\"amount\":1}", &lnbits, &buf);
+    const pay_json = try handleRequest(testing.allocator, pay, "{\"invoice\":\"lnbc50n1pdummy\",\"amount\":1}", &lnbits, &buf);
     try testing.expectEqualStrings("Amount does not match invoice", nwc.Response.parseJson(pay_json).?.err.?.message);
+
+    const bad_checksum = nwc.Request{ .method = .pay_invoice, .params = .{ .pay_invoice = .{ .invoice = "lnbc50n1pdummy" } } };
+    const bad_json = try handleRequest(testing.allocator, bad_checksum, "{\"invoice\":\"lnbc50n1pdummy\"}", &lnbits, &buf);
+    try testing.expectEqualStrings("Invalid invoice", nwc.Response.parseJson(bad_json).?.err.?.message);
 }

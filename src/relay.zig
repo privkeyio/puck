@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const nostr = @import("nostr");
 const ws = nostr.ws;
 const utils = nostr.utils;
@@ -41,6 +42,7 @@ pub const Relay = struct {
             log.err("WebSocket connection failed: {}", .{err});
             return RelayError.ConnectionFailed;
         };
+        enableKeepalive(client.tcp_stream.socket.handle);
 
         return .{
             .allocator = allocator,
@@ -92,6 +94,30 @@ pub const Relay = struct {
         try self.send(msg);
     }
 };
+
+/// A relay that vanishes without closing the connection (host down, NAT
+/// timeout) would otherwise leave the blocking read waiting forever. Kernel
+/// keepalive probes, plus a cap on unacknowledged writes, turn that into a read
+/// error after about 90 seconds, which drops into the reconnect loop.
+// Detects a dead peer, not a live relay that stops sending; an application
+// level ping (REQ answered by EOSE) would cover that too.
+fn enableKeepalive(fd: std.posix.fd_t) void {
+    const set = struct {
+        fn opt(sock: std.posix.fd_t, level: i32, name: u32, value: c_int) void {
+            std.posix.setsockopt(sock, level, name, std.mem.asBytes(&value)) catch |err| {
+                log.warn("setsockopt {d}/{d} failed: {}", .{ level, name, err });
+            };
+        }
+    }.opt;
+    set(fd, std.posix.SOL.SOCKET, std.posix.SO.KEEPALIVE, 1);
+    if (builtin.os.tag == .linux) {
+        const tcp = std.posix.IPPROTO.TCP;
+        set(fd, tcp, std.posix.TCP.KEEPIDLE, 60);
+        set(fd, tcp, std.posix.TCP.KEEPINTVL, 10);
+        set(fd, tcp, std.posix.TCP.KEEPCNT, 3);
+        set(fd, tcp, std.posix.TCP.USER_TIMEOUT, 90_000);
+    }
+}
 
 fn freeMessageWith(allocator: std.mem.Allocator, message: *Message) void {
     switch (message.*) {

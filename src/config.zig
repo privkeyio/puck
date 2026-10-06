@@ -9,12 +9,15 @@ pub const Config = struct {
     lnbits_host: []const u8,
     lnbits_admin_key: []const u8,
 
-    _allocated: std.ArrayListUnmanaged([]const u8),
+    _allocated: std.ArrayListUnmanaged([]u8),
     _allocator: std.mem.Allocator,
 
     pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Config {
         const content = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
-        defer allocator.free(content);
+        defer {
+            std.crypto.secureZero(u8, content);
+            allocator.free(content);
+        }
         return parse(allocator, content);
     }
 
@@ -116,6 +119,7 @@ pub const Config = struct {
             }
         } else if (value.len == 64) {
             var key: [32]u8 = undefined;
+            defer std.crypto.secureZero(u8, &key);
             _ = std.fmt.hexToBytes(&key, value) catch return error.InvalidPrivkey;
             return key;
         }
@@ -149,6 +153,7 @@ pub const Config = struct {
 
     pub fn deinit(self: *Config) void {
         for (self._allocated.items) |s| {
+            std.crypto.secureZero(u8, s);
             self._allocator.free(s);
         }
         self._allocated.deinit(self._allocator);
@@ -182,6 +187,9 @@ test "parse full config with client pubkey list" {
     defer config.deinit();
 
     try std.testing.expectEqualStrings("ws://127.0.0.1:7777", config.relay);
+    var want_privkey: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&want_privkey, test_privkey);
+    try std.testing.expectEqualSlices(u8, &want_privkey, &config.privkey);
     try std.testing.expectEqual(@as(usize, 2), config.client_pubkeys.items.len);
 
     var client: [32]u8 = undefined;
