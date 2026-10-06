@@ -435,9 +435,40 @@ fn checkPayInvoice(params_json: []const u8, params: nwc.Request.PayInvoice) ?nwc
 /// PAYMENT_FAILED: the payment may still complete, so a blind retry could pay twice.
 const payment_unknown_message = "Payment status unknown, it may still complete; check lookup_invoice before retrying";
 
+/// Cap on free text copied into a response (LNbits error details, memos,
+/// wallet names). JSON escaping can grow text sixfold, and the response must
+/// fit the 16 KiB buffer together with a bolt11 of up to `max_invoice_len`.
+const max_text_len = 1024;
+const max_invoice_len = 4096;
+
+/// `s` cut to at most `max_text_len` bytes without splitting a UTF-8 sequence.
+fn clip(s: []const u8) []const u8 {
+    if (s.len <= max_text_len) return s;
+    var end: usize = max_text_len;
+    while (end > 0 and s[end] & 0xC0 == 0x80) end -= 1;
+    return s[0..end];
+}
+
+/// Serializes `response`, or, if it does not fit, an INTERNAL error that
+/// still answers the request (for pay_invoice without claiming failure).
+fn serializeOrFallback(response: nwc.Response, buf: []u8) ![]u8 {
+    return response.serialize(buf) catch {
+        std.log.warn("{s} response does not fit, sending an error instead", .{response.result_type.toString()});
+        const fallback: nwc.Response = .{
+            .result_type = response.result_type,
+            .err = .{
+                .code = .internal,
+                .message = if (response.result_type == .pay_invoice) payment_unknown_message else "Response too large",
+            },
+        };
+        return fallback.serialize(buf);
+    };
+}
+
 fn handleRequest(arena: std.mem.Allocator, request: nwc.Request, params_json: []const u8, lnbits: *LnbitsClient, buf: []u8) ![]u8 {
     var response: nwc.Response = .{ .result_type = request.method };
     var preimage_hex: [64]u8 = undefined;
+    var message_buf: [max_text_len + 64]u8 = undefined;
 
     switch (request.params) {
         .get_balance => {
@@ -453,7 +484,7 @@ fn handleRequest(arena: std.mem.Allocator, request: nwc.Request, params_json: []
                 return response.serialize(buf);
             };
             response.result = .{ .get_info = .{
-                .alias = wallet.name,
+                .alias = clip(wallet.name),
                 .network = "mainnet",
                 .methods = &supported_methods,
             } };
@@ -473,7 +504,7 @@ fn handleRequest(arena: std.mem.Allocator, request: nwc.Request, params_json: []
                 .invoice = invoice.payment_request,
                 .payment_hash = invoice.payment_hash,
                 .amount = params.amount,
-                .description = params.description,
+                .description = if (params.description) |d| clip(d) else null,
                 .created_at = nostr.io.timestamp(),
             } };
         },
@@ -490,21 +521,15 @@ fn handleRequest(arena: std.mem.Allocator, request: nwc.Request, params_json: []
 
             switch (try lnbits.payInvoice(arena, params.invoice, &payment_hash)) {
                 .paid => |paid| {
-                    const preimage: []const u8 = if (paid.preimage) |p| blk: {
-                        preimage_hex = std.fmt.bytesToHex(&p, .lower);
-                        break :blk &preimage_hex;
-                    } else blk: {
-                        std.log.warn("Payment succeeded but LNbits returned no matching preimage", .{});
-                        break :blk "";
-                    };
+                    preimage_hex = std.fmt.bytesToHex(&paid.preimage, .lower);
                     response.result = .{ .pay_invoice = .{
-                        .preimage = preimage,
+                        .preimage = &preimage_hex,
                         .fees_paid = paid.fee_msat,
                     } };
                 },
                 .failed => |reason| response.err = .{
                     .code = .payment_failed,
-                    .message = try std.fmt.allocPrint(arena, "Payment failed: {s}", .{reason}),
+                    .message = std.fmt.bufPrint(&message_buf, "Payment failed: {s}", .{clip(reason)}) catch "Payment failed",
                 },
                 .unknown => response.err = .{ .code = .internal, .message = payment_unknown_message },
             }
@@ -530,12 +555,15 @@ fn handleRequest(arena: std.mem.Allocator, request: nwc.Request, params_json: []
                         .pending => .pending,
                     },
                     // libnostr-z writes the invoice unescaped.
-                    .invoice = if (details.bolt11) |b| if (isAlphanumeric(b)) b else null else null,
+                    .invoice = if (details.bolt11) |b| if (b.len <= max_invoice_len and isAlphanumeric(b)) b else null else null,
                     .payment_hash = hash,
-                    .preimage = if (details.preimage) |p| try arena.dupe(u8, &std.fmt.bytesToHex(&p, .lower)) else null,
+                    .preimage = if (details.preimage) |p| blk: {
+                        preimage_hex = std.fmt.bytesToHex(&p, .lower);
+                        break :blk &preimage_hex;
+                    } else null,
                     .amount = if (details.amount_msat) |a| if (a != 0) @abs(a) else null else null,
                     .fees_paid = details.fee_msat,
-                    .description = if (details.memo) |m| if (m.len > 0) m else null else null,
+                    .description = if (details.memo) |m| if (m.len > 0) clip(m) else null else null,
                 },
             };
         },
@@ -544,7 +572,7 @@ fn handleRequest(arena: std.mem.Allocator, request: nwc.Request, params_json: []
         },
     }
 
-    return response.serialize(buf);
+    return serializeOrFallback(response, buf);
 }
 
 /// Signs a kind 23195 response encrypted to the requester with the scheme the
@@ -927,4 +955,50 @@ test "handleRequest rejects invalid make_invoice amounts without calling LNbits"
     const bad_checksum = nwc.Request{ .method = .pay_invoice, .params = .{ .pay_invoice = .{ .invoice = "lnbc50n1pdummy" } } };
     const bad_json = try handleRequest(testing.allocator, bad_checksum, "{\"invoice\":\"lnbc50n1pdummy\"}", &lnbits, &buf);
     try testing.expectEqualStrings("Invalid invoice", nwc.Response.parseJson(bad_json).?.err.?.message);
+}
+
+test "clip keeps responses with huge LNbits text inside the response buffer" {
+    const huge = try testing.allocator.alloc(u8, 64 * 1024);
+    defer testing.allocator.free(huge);
+    @memset(huge, '"');
+    const memo = try testing.allocator.alloc(u8, 64 * 1024);
+    defer testing.allocator.free(memo);
+    @memset(memo, 0x01);
+
+    var buf: [16384]u8 = undefined;
+    var message_buf: [max_text_len + 64]u8 = undefined;
+    const failed: nwc.Response = .{ .result_type = .pay_invoice, .err = .{
+        .code = .payment_failed,
+        .message = try std.fmt.bufPrint(&message_buf, "Payment failed: {s}", .{clip(huge)}),
+    } };
+    const failed_json = try failed.serialize(&buf);
+    const parsed = nwc.Response.parseJson(failed_json).?;
+    try testing.expectEqual(nwc.ErrorCode.payment_failed, parsed.err.?.code);
+
+    const invoice: [max_invoice_len]u8 = @splat('q');
+    const preimage: [64]u8 = @splat('a');
+    const lookup: nwc.Response = .{ .result_type = .lookup_invoice, .result = .{ .lookup_invoice = .{
+        .tx_type = .outgoing,
+        .state = .settled,
+        .invoice = &invoice,
+        .payment_hash = &preimage,
+        .preimage = &preimage,
+        .amount = 1000,
+        .fees_paid = 1000,
+        .description = clip(memo),
+    } } };
+    _ = try lookup.serialize(&buf);
+
+    const unclipped: nwc.Response = .{ .result_type = .pay_invoice, .err = .{ .code = .payment_failed, .message = huge } };
+    const fallback = nwc.Response.parseJson(try serializeOrFallback(unclipped, &buf)).?;
+    try testing.expectEqual(nwc.ErrorCode.internal, fallback.err.?.code);
+    try testing.expectEqualStrings(payment_unknown_message, fallback.err.?.message);
+}
+
+test "clip does not split UTF-8 sequences" {
+    var text: [max_text_len + 2]u8 = @splat('a');
+    text[max_text_len - 1] = 0xC3;
+    text[max_text_len] = 0xA9;
+    try testing.expectEqual(@as(usize, max_text_len - 1), clip(&text).len);
+    try testing.expectEqualStrings("short", clip("short"));
 }

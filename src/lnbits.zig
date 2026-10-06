@@ -40,11 +40,31 @@ pub const PaymentDetails = struct {
     fee_msat: ?u64 = null,
     memo: ?[]const u8 = null,
     bolt11: ?[]const u8 = null,
+    /// LNbits' `details.updated_at`, compared verbatim to detect a changed row.
+    updated_at: ?[]const u8 = null,
 };
 
 pub const Paid = struct {
-    preimage: ?[32]u8,
+    /// Always verified against the payment hash.
+    preimage: [32]u8,
     fee_msat: ?u64,
+};
+
+/// Result of asking LNbits for the wallet's outgoing payment with a hash.
+pub const Lookup = union(enum) {
+    found: PaymentDetails,
+    not_found,
+    /// LNbits could not be asked or gave no usable answer.
+    unavailable,
+};
+
+/// The wallet's row for the payment hash just before the pay call, so a
+/// failure recorded by an earlier attempt is not mistaken for this one's.
+pub const Baseline = union(enum) {
+    none,
+    /// Existing row; holds its `updated_at` if LNbits returned one.
+    row: ?[]const u8,
+    unknown,
 };
 
 pub const PayOutcome = union(enum) {
@@ -128,6 +148,14 @@ pub const Client = struct {
         const hash_hex = std.fmt.bytesToHex(payment_hash, .lower);
         const body = try std.fmt.allocPrint(arena, "{{\"out\":true,\"bolt11\":\"{s}\"}}", .{bolt11});
 
+        // Compared against the row's `updated_at` instead of a clock, so
+        // clock skew between Puck and LNbits cannot make a stale row look new.
+        const baseline: Baseline = switch (self.lookupOutgoing(arena, &hash_hex)) {
+            .found => |d| .{ .row = d.updated_at },
+            .not_found => .none,
+            .unavailable => .unknown,
+        };
+
         const post: PostOutcome = if (self.send(arena, .POST, "/api/v1/payments", body, pay_timeout_s)) |response|
             classifyPayResponse(arena, response, payment_hash)
         else |err| switch (err) {
@@ -143,25 +171,13 @@ pub const Client = struct {
 
         switch (post) {
             .paid => |paid| return .{ .paid = paid },
-            .failed => |reason| {
-                // A rejection can follow a completed payment (LNbits bookkeeping
-                // after the payment), or race an earlier attempt still in flight.
-                const details = self.lookupOutgoing(arena, &hash_hex) orelse return .{ .failed = reason };
-                return switch (details.state) {
-                    .paid => .{ .paid = .{ .preimage = details.preimage, .fee_msat = details.fee_msat } },
-                    .failed => .{ .failed = reason },
-                    .pending => .unknown,
-                };
-            },
+            // A rejection can follow a completed payment (LNbits bookkeeping
+            // after the payment), or race an earlier attempt still in flight.
+            .failed => |reason| return resolveRejected(reason, self.lookupOutgoing(arena, &hash_hex)),
             .ambiguous => {
                 for (lookup_backoff_s) |delay| {
                     if (delay > 0) std.Io.sleep(self.io, .fromSeconds(delay), .awake) catch {};
-                    const details = self.lookupOutgoing(arena, &hash_hex) orelse continue;
-                    switch (details.state) {
-                        .paid => return .{ .paid = .{ .preimage = details.preimage, .fee_msat = details.fee_msat } },
-                        .failed => return .{ .failed = "LNbits reported the payment as failed" },
-                        .pending => {},
-                    }
+                    if (resolveUnclear(self.lookupOutgoing(arena, &hash_hex), baseline)) |outcome| return outcome;
                 }
                 log.warn("payment {s}: outcome still unknown after lookups", .{&hash_hex});
                 return .unknown;
@@ -169,16 +185,22 @@ pub const Client = struct {
         }
     }
 
-    /// The wallet's outgoing payment for `hash_hex`, or null if LNbits has none
-    /// or could not be asked.
-    fn lookupOutgoing(self: *Client, arena: std.mem.Allocator, hash_hex: *const [64]u8) ?PaymentDetails {
-        const details = self.lookupPayment(arena, hash_hex) catch |err| {
-            log.warn("payment {s}: lookup failed: {t}", .{ hash_hex, err });
-            return null;
+    /// The wallet's outgoing payment for `hash_hex`. An incoming row with the
+    /// same hash (paying the wallet's own invoice) counts as not found.
+    fn lookupOutgoing(self: *Client, arena: std.mem.Allocator, hash_hex: *const [64]u8) Lookup {
+        const details = self.lookupPayment(arena, hash_hex) catch |err| switch (err) {
+            LnbitsError.InvoiceNotFound => {
+                log.info("payment {s}: lookup found no payment", .{hash_hex});
+                return .not_found;
+            },
+            else => {
+                log.warn("payment {s}: lookup failed: {t}", .{ hash_hex, err });
+                return .unavailable;
+            },
         };
-        if (details.amount_msat) |amount| if (amount > 0) return null;
+        if (details.amount_msat) |amount| if (amount > 0) return .not_found;
         log.info("payment {s}: lookup state {t}", .{ hash_hex, details.state });
-        return details;
+        return .{ .found = details };
     }
 
     pub fn lookupPayment(self: *Client, arena: std.mem.Allocator, payment_hash: []const u8) !PaymentDetails {
@@ -287,10 +309,11 @@ pub fn classifyPayResponse(arena: std.mem.Allocator, response: HttpResponse, pay
             if (!std.ascii.eqlIgnoreCase(h, &want)) return .ambiguous;
         }
         const s = status orelse return .ambiguous;
-        if (std.mem.eql(u8, s, "success")) return .{ .paid = .{
-            .preimage = verifiedPreimage(stringField(obj, "preimage"), payment_hash),
-            .fee_msat = feeMsat(obj.get("fee")),
-        } };
+        if (std.mem.eql(u8, s, "success")) {
+            // Success without a verifiable preimage is settled by a lookup.
+            const preimage = verifiedPreimage(stringField(obj, "preimage"), payment_hash) orelse return .ambiguous;
+            return .{ .paid = .{ .preimage = preimage, .fee_msat = feeMsat(obj.get("fee")) } };
+        }
         if (std.mem.eql(u8, s, "failed")) return .{ .failed = "LNbits reported the payment as failed" };
         return .ambiguous;
     }
@@ -304,6 +327,52 @@ pub fn classifyPayResponse(arena: std.mem.Allocator, response: HttpResponse, pay
         return .{ .failed = detail orelse "LNbits rejected the payment request" };
     }
     return .ambiguous;
+}
+
+fn paidOutcome(details: PaymentDetails) ?PayOutcome {
+    const preimage = details.preimage orelse return null;
+    return .{ .paid = .{ .preimage = preimage, .fee_msat = details.fee_msat } };
+}
+
+/// Outcome after LNbits definitively rejected the pay call, given a lookup
+/// made afterwards. Only a lookup that could not be made, a pending row, or a
+/// paid row without a verifiable preimage leave the outcome unknown.
+pub fn resolveRejected(reason: []const u8, lookup: Lookup) PayOutcome {
+    return switch (lookup) {
+        .not_found => .{ .failed = reason },
+        .unavailable => .unknown,
+        .found => |d| switch (d.state) {
+            .paid => paidOutcome(d) orelse .unknown,
+            .failed => .{ .failed = reason },
+            .pending => .unknown,
+        },
+    };
+}
+
+/// Final outcome from one lookup after an unclear pay call, or null to keep
+/// polling. A failed row only counts if it is new since `baseline`.
+pub fn resolveUnclear(lookup: Lookup, baseline: Baseline) ?PayOutcome {
+    const d = switch (lookup) {
+        .found => |d| d,
+        .not_found, .unavailable => return null,
+    };
+    return switch (d.state) {
+        .paid => paidOutcome(d),
+        .pending => null,
+        .failed => if (failedSince(baseline, d.updated_at)) .{ .failed = "LNbits reported the payment as failed" } else null,
+    };
+}
+
+fn failedSince(baseline: Baseline, updated_at: ?[]const u8) bool {
+    return switch (baseline) {
+        .none => true,
+        .unknown => false,
+        .row => |before| blk: {
+            const b = before orelse break :blk false;
+            const now = updated_at orelse break :blk false;
+            break :blk !std.mem.eql(u8, b, now);
+        },
+    };
 }
 
 /// Parses `GET /api/v1/payments/{hash}`: `paid` is authoritative, otherwise a
@@ -340,6 +409,7 @@ pub fn parsePaymentDetails(arena: std.mem.Allocator, body: []const u8, payment_h
         if (paid) result.fee_msat = feeMsat(d.get("fee"));
         result.memo = stringField(d, "memo");
         result.bolt11 = stringField(d, "bolt11");
+        result.updated_at = stringField(d, "updated_at");
     }
     return result;
 }
@@ -462,13 +532,16 @@ test "classifyPayResponse separates definitive outcomes from ambiguous ones" {
     const paid = try classifyBody(arena, 201,
         \\{{"payment_hash":"{[hash]s}","status":"success","preimage":"{[preimage]s}","fee":-2000,"memo":"x"}}
     , &p);
-    try std.testing.expectEqualSlices(u8, &p.preimage, &paid.paid.preimage.?);
+    try std.testing.expectEqualSlices(u8, &p.preimage, &paid.paid.preimage);
     try std.testing.expectEqual(@as(?u64, 2000), paid.paid.fee_msat);
 
     const wrong_preimage = try classifyBody(arena, 201,
         \\{{"payment_hash":"{[hash]s}","status":"success","preimage":"{[hash]s}","memo":"{[preimage]s}"}}
     , &p);
-    try std.testing.expectEqual(@as(?[32]u8, null), wrong_preimage.paid.preimage);
+    try std.testing.expect(wrong_preimage == .ambiguous);
+
+    const no_preimage = classifyPayResponse(arena, .{ .status = 201, .body = "{\"status\":\"success\",\"preimage\":null}" }, &p.hash);
+    try std.testing.expect(no_preimage == .ambiguous);
 
     const insufficient = classifyPayResponse(arena, .{ .status = 520, .body = "{\"detail\":\"Insufficient balance.\",\"status\":\"failed\"}" }, &p.hash);
     try std.testing.expectEqualStrings("Insufficient balance.", insufficient.failed);
@@ -512,7 +585,7 @@ test "parsePaymentDetails reads LNbits payment lookups" {
     const p = TestPayment.init();
 
     const paid_body = try std.fmt.allocPrint(arena,
-        \\{{"paid":true,"preimage":"{s}","details":{{"amount":-1000,"fee":-3000,"status":"success","memo":"m","bolt11":"lnbc"}}}}
+        \\{{"paid":true,"preimage":"{s}","details":{{"amount":-1000,"fee":-3000,"status":"success","memo":"m","bolt11":"lnbc","updated_at":"2026-10-06T10:00:00.123456+00:00"}}}}
     , .{&p.preimage_hex});
     const paid = parsePaymentDetails(arena, paid_body, &p.hash).?;
     try std.testing.expectEqual(PaymentState.paid, paid.state);
@@ -520,6 +593,7 @@ test "parsePaymentDetails reads LNbits payment lookups" {
     try std.testing.expectEqual(@as(?i64, -1000), paid.amount_msat);
     try std.testing.expectEqual(@as(?u64, 3000), paid.fee_msat);
     try std.testing.expectEqualStrings("m", paid.memo.?);
+    try std.testing.expectEqualStrings("2026-10-06T10:00:00.123456+00:00", paid.updated_at.?);
 
     const failed = parsePaymentDetails(arena, "{\"paid\":false,\"status\":\"failed\",\"details\":{\"amount\":-1000,\"fee\":-10}}", &p.hash).?;
     try std.testing.expectEqual(PaymentState.failed, failed.state);
@@ -533,4 +607,34 @@ test "parsePaymentDetails reads LNbits payment lookups" {
 
     try std.testing.expect(parsePaymentDetails(arena, "{\"detail\":\"Payment does not exist.\"}", &p.hash) == null);
     try std.testing.expect(parsePaymentDetails(arena, "[]", &p.hash) == null);
+}
+
+test "resolveRejected and resolveUnclear never report an unverified success or a stale failure" {
+    const p = TestPayment.init();
+    const paid: PaymentDetails = .{ .state = .paid, .preimage = p.preimage, .fee_msat = 5 };
+    const paid_no_preimage: PaymentDetails = .{ .state = .paid };
+    const pending: PaymentDetails = .{ .state = .pending };
+    const old_failed: PaymentDetails = .{ .state = .failed, .updated_at = "2026-01-01T00:00:00+00:00" };
+    const new_failed: PaymentDetails = .{ .state = .failed, .updated_at = "2026-10-06T10:00:01+00:00" };
+    const undated_failed: PaymentDetails = .{ .state = .failed };
+
+    try std.testing.expectEqualStrings("no funds", resolveRejected("no funds", .not_found).failed);
+    try std.testing.expectEqualStrings("no funds", resolveRejected("no funds", .{ .found = old_failed }).failed);
+    try std.testing.expect(resolveRejected("no funds", .unavailable) == .unknown);
+    try std.testing.expect(resolveRejected("no funds", .{ .found = pending }) == .unknown);
+    try std.testing.expect(resolveRejected("no funds", .{ .found = paid_no_preimage }) == .unknown);
+    try std.testing.expectEqualSlices(u8, &p.preimage, &resolveRejected("no funds", .{ .found = paid }).paid.preimage);
+
+    const old_row: Baseline = .{ .row = "2026-01-01T00:00:00+00:00" };
+    try std.testing.expect(resolveUnclear(.{ .found = old_failed }, old_row) == null);
+    try std.testing.expect(resolveUnclear(.{ .found = new_failed }, old_row).? == .failed);
+    try std.testing.expect(resolveUnclear(.{ .found = undated_failed }, old_row) == null);
+    try std.testing.expect(resolveUnclear(.{ .found = new_failed }, .{ .row = null }) == null);
+    try std.testing.expect(resolveUnclear(.{ .found = new_failed }, .unknown) == null);
+    try std.testing.expect(resolveUnclear(.{ .found = undated_failed }, .none).? == .failed);
+    try std.testing.expect(resolveUnclear(.{ .found = paid_no_preimage }, .none) == null);
+    try std.testing.expect(resolveUnclear(.{ .found = pending }, .none) == null);
+    try std.testing.expect(resolveUnclear(.not_found, .none) == null);
+    try std.testing.expect(resolveUnclear(.unavailable, .none) == null);
+    try std.testing.expectEqual(@as(?u64, 5), resolveUnclear(.{ .found = paid }, old_row).?.paid.fee_msat);
 }
