@@ -186,7 +186,9 @@ pub const Client = struct {
     }
 
     /// The wallet's outgoing payment for `hash_hex`. An incoming row with the
-    /// same hash (paying the wallet's own invoice) counts as not found.
+    /// same hash (paying the wallet's own invoice) counts as not found, and so
+    /// does a row with no amount: the wallet's own paid invoice carries a valid
+    /// preimage, so it must never be mistaken for this payment.
     fn lookupOutgoing(self: *Client, arena: std.mem.Allocator, hash_hex: *const [64]u8) Lookup {
         const details = self.lookupPayment(arena, hash_hex) catch |err| switch (err) {
             LnbitsError.InvoiceNotFound => {
@@ -198,7 +200,8 @@ pub const Client = struct {
                 return .unavailable;
             },
         };
-        if (details.amount_msat) |amount| if (amount > 0) return .not_found;
+        const amount = details.amount_msat orelse return .not_found;
+        if (amount >= 0) return .not_found;
         log.info("payment {s}: lookup state {t}", .{ hash_hex, details.state });
         return .{ .found = details };
     }
